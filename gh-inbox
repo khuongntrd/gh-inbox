@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+############################################
+# args
+############################################
+CMD="${1:-}"
+SUBCMD="${2:-}"
+[[ $# -gt 0 ]] && shift
+[[ $# -gt 0 ]] && shift
+
+ORG="${GITHUB_ORG:-}"
+DEBUG="${DEBUG:-0}"
+STATUS_INPUT=""
+FORMAT="simple"
+
+############################################
+# flags
+############################################
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --org)
+      ORG="$2"
+      shift 2
+      ;;
+    --status)
+      STATUS_INPUT="$2"
+      shift 2
+      ;;
+    --format)
+      FORMAT="$2"
+      shift 2
+      ;;
+    --debug)
+      DEBUG=1
+      shift
+      ;;
+    *)
+      echo "Unknown flag: $1"
+      exit 1
+      ;;
+  esac
+done
+
+############################################
+# logging
+############################################
+log() {
+  if [[ "$DEBUG" == "1" ]]; then
+    echo "[DEBUG] $*" >&2
+  fi
+}
+
+emit_items() {
+  local items="$1"
+  local label="$2"
+  local count
+  count="$(jq 'length' <<<"$items")"
+
+  if [[ "$count" == "0" ]]; then
+    log "No $label results"
+    [[ "$FORMAT" == "json" ]] && echo "[]"
+    return
+  fi
+
+  if [[ "$FORMAT" == "json" ]]; then
+    jq '.' <<<"$items"
+  else
+    jq -r '.[].url' <<<"$items"
+  fi
+}
+
+usage() {
+  cat <<EOF
+gh inbox — personal GitHub inbox
+
+Usage:
+  gh inbox pr review        PRs needing your review
+  gh inbox pr mine          PRs you created
+  gh inbox pr changes       PRs with changes requested
+  gh inbox todo             Issues in "Todo-like" status
+
+Options:
+  --org <org>               Override org (fallback: GITHUB_ORG)
+  --status "A,B,C"          Todo status names (default: Todo,Ready,To Do)
+  --format <simple|json>    simple = url per line (default); json = [{title, description, url}]
+  --debug                   Enable debug logs
+
+Env:
+  GITHUB_ORG
+  INBOX_TODO_STATUS
+EOF
+}
+
+############################################
+# validate
+############################################
+if [[ -z "$CMD" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ "$FORMAT" != "simple" && "$FORMAT" != "json" ]]; then
+  echo "Error: --format must be 'simple' or 'json' (got: $FORMAT)"
+  exit 1
+fi
+
+if ! gh auth status >/dev/null 2>&1; then
+  echo "Error: not authenticated (gh auth login)"
+  exit 1
+fi
+
+if [[ -z "$ORG" ]]; then
+  ORG="$(gh repo view --json owner -q .owner.login 2>/dev/null || true)"
+  [[ -n "$ORG" ]] && log "Org resolved from current repo: $ORG"
+fi
+
+if [[ -z "$ORG" ]]; then
+  echo "Error: provide --org, set GITHUB_ORG, or run inside a GitHub repo"
+  exit 1
+fi
+
+CURRENT_USER="$(gh api user --jq '.login')"
+log "User=$CURRENT_USER Org=$ORG CMD=$CMD SUBCMD=$SUBCMD"
+
+############################################
+# fetch PRs
+############################################
+fetch_prs() {
+  gh api graphql -f query='
+  query($org: String!) {
+    organization(login: $org) {
+      repositories(first: 50, isArchived: false) {
+        nodes {
+          name
+          isArchived
+          pullRequests(first: 50, states: OPEN) {
+            nodes {
+              url
+              title
+              body
+              isDraft
+              author { login }
+              reviewDecision
+              reviewRequests(first: 10) {
+                nodes {
+                  requestedReviewer {
+                    __typename
+                    ... on User { login }
+                    ... on Team { slug }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }' -f org="$ORG"
+}
+
+############################################
+# PR commands
+############################################
+if [[ "$CMD" == "pr" ]]; then
+
+  RAW="$(fetch_prs)"
+
+  [[ "$DEBUG" == "1" ]] && echo "$RAW" | jq '.' > debug_prs.json || true
+
+  case "$SUBCMD" in
+
+    review)
+      ITEMS_JSON="$(
+        jq --arg USER "$CURRENT_USER" '
+          [ .data.organization.repositories.nodes[]?
+            | .pullRequests.nodes[]?
+            | select(.isDraft == false)
+            | select(
+                any(.reviewRequests.nodes[]?;
+                  .requestedReviewer.login? == $USER
+                )
+              )
+            | {title, description: .body, url}
+          ]
+        ' <<<"$RAW" 2>/dev/null || echo '[]'
+      )"
+      ;;
+
+    mine)
+      ITEMS_JSON="$(
+        jq --arg USER "$CURRENT_USER" '
+          [ .data.organization.repositories.nodes[]?
+            | .pullRequests.nodes[]?
+            | select(.author.login == $USER)
+            | {title, description: .body, url}
+          ]
+        ' <<<"$RAW" 2>/dev/null || echo '[]'
+      )"
+      ;;
+
+    changes)
+      ITEMS_JSON="$(
+        jq '
+          [ .data.organization.repositories.nodes[]?
+            | .pullRequests.nodes[]?
+            | select(.reviewDecision == "CHANGES_REQUESTED")
+            | {title, description: .body, url}
+          ]
+        ' <<<"$RAW" 2>/dev/null || echo '[]'
+      )"
+      ;;
+
+    *)
+      echo "Unknown pr command: $SUBCMD"
+      usage
+      exit 1
+      ;;
+  esac
+
+  emit_items "$ITEMS_JSON" "PR"
+
+############################################
+# TODO issues
+############################################
+elif [[ "$CMD" == "todo" ]]; then
+
+  STATUS_INPUT="${STATUS_INPUT:-${INBOX_TODO_STATUS:-📝 Todo}}"
+
+  STATUS_JSON="$(jq -Rn --arg s "$STATUS_INPUT" '
+    $s
+    | split(",")
+    | map(gsub("^\\s+|\\s+$"; "") | ascii_downcase)
+  ')"
+
+  log "Statuses=$STATUS_JSON"
+
+  SEARCH_Q="org:$ORG assignee:$CURRENT_USER is:issue is:open"
+  log "Search query: $SEARCH_Q"
+
+  RAW="$(gh api graphql -f query='
+  query($q: String!) {
+    search(query: $q, type: ISSUE, first: 50) {
+      nodes {
+        ... on Issue {
+          url
+          title
+          body
+          projectItems(first: 10) {
+            nodes {
+              fieldValues(first: 10) {
+                nodes {
+                  ... on ProjectV2ItemFieldSingleSelectValue {
+                    name
+                    field {
+                      ... on ProjectV2SingleSelectField {
+                        name
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }' -f q="$SEARCH_Q")"
+
+  [[ "$DEBUG" == "1" ]] && echo "$RAW" | jq '.' > debug_issues.json || true
+
+  ITEMS_JSON="$(
+    jq --argjson STATUS "$STATUS_JSON" '
+      [ .data.search.nodes[]?
+        | select(
+            any(.projectItems.nodes[]?.fieldValues.nodes[]?;
+              (.field.name == "Status")
+              and (
+                (.name | ascii_downcase) as $n
+                | any($STATUS[]; . == $n)
+              )
+            )
+          )
+        | {title, description: .body, url}
+      ]
+    ' <<<"$RAW" 2>/dev/null || echo '[]'
+  )"
+
+  emit_items "$ITEMS_JSON" "TODO issue"
+
+############################################
+# fallback
+############################################
+else
+  usage
+  exit 1
+fi
