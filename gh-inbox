@@ -82,7 +82,7 @@ Usage:
   gh inbox todo             Issues in "Todo-like" status
 
 Options:
-  --org <org>               Override org (fallback: GITHUB_ORG)
+  --org <org>               Override org (fallback: GITHUB_ORG, repo owner, then gh org list)
   --status "A,B,C"          Todo status names (default: Todo,Ready,To Do)
   --format <simple|json>    simple = url per line (default); json = [{title, description, url}]
   --debug                   Enable debug logs
@@ -117,7 +117,20 @@ if [[ -z "$ORG" ]]; then
 fi
 
 if [[ -z "$ORG" ]]; then
-  echo "Error: provide --org, set GITHUB_ORG, or run inside a GitHub repo"
+  ORG_CANDIDATES="$(gh org list 2>/dev/null || true)"
+
+  if [[ -n "$ORG_CANDIDATES" ]]; then
+    ORG="$(head -n 1 <<<"$ORG_CANDIDATES")"
+    log "Org resolved from gh org list: $ORG"
+
+    if [[ "$(wc -l <<<"$ORG_CANDIDATES" | tr -d ' ')" -gt 1 ]]; then
+      log "Multiple orgs found; defaulting to first. Use --org to override."
+    fi
+  fi
+fi
+
+if [[ -z "$ORG" ]]; then
+  echo "Error: provide --org, set GITHUB_ORG, run inside a GitHub repo, or ensure gh org list returns at least one org"
   exit 1
 fi
 
