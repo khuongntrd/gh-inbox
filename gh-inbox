@@ -117,13 +117,13 @@ if [[ -z "$ORG" ]]; then
 fi
 
 if [[ -z "$ORG" ]]; then
-  ORG_CANDIDATES="$(gh org list 2>/dev/null || true)"
+  ORG_COUNT="$(gh api user/orgs --jq 'length' 2>/dev/null || true)"
 
-  if [[ -n "$ORG_CANDIDATES" ]]; then
-    ORG="$(printf '%s\n' "$ORG_CANDIDATES" | awk 'NR > 1 && NF { print; exit }')"
-    log "Org resolved from gh org list: $ORG"
+  if [[ -n "$ORG_COUNT" && "$ORG_COUNT" != "0" ]]; then
+    ORG="$(gh api user/orgs --jq '.[0].login' 2>/dev/null || true)"
+    log "Org resolved from gh api user/orgs: $ORG"
 
-    if [[ "$(wc -l <<<"$ORG_CANDIDATES" | tr -d ' ')" -gt 1 ]]; then
+    if [[ "$ORG_COUNT" -gt 1 ]]; then
       log "Multiple orgs found; defaulting to first. Use --org to override."
     fi
   fi
