@@ -120,7 +120,7 @@ if [[ -z "$ORG" ]]; then
   ORG_CANDIDATES="$(gh org list 2>/dev/null || true)"
 
   if [[ -n "$ORG_CANDIDATES" ]]; then
-    ORG="$(head -n 1 <<<"$ORG_CANDIDATES")"
+    ORG="$(printf '%s\n' "$ORG_CANDIDATES" | awk 'NR > 1 && NF { print; exit }')"
     log "Org resolved from gh org list: $ORG"
 
     if [[ "$(wc -l <<<"$ORG_CANDIDATES" | tr -d ' ')" -gt 1 ]]; then
